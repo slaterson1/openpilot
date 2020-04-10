@@ -30,6 +30,17 @@ static void set_brightness(UIState *s, int brightness) {
   }
 }
 
+int event_processing_enabled = -1;
+static void enable_event_processing(bool yes) {
+  if (event_processing_enabled != 1 && yes) {
+    system("service call window 18 i32 1");  // enable event processing
+    event_processing_enabled = 1;
+  } else if (event_processing_enabled != 0 && !yes) {
+    system("service call window 18 i32 0");  // disable event processing
+    event_processing_enabled = 0;
+  }
+}
+
 static void set_awake(UIState *s, bool awake) {
 #ifdef QCOM
   if (awake) {
@@ -42,13 +53,13 @@ static void set_awake(UIState *s, bool awake) {
     // TODO: replace command_awake and command_sleep with direct calls to android
     if (awake) {
       LOGW("awake normal");
-      system("service call window 18 i32 1");  // enable event processing
       framebuffer_set_power(s->fb, HWC_POWER_MODE_NORMAL);
+      enable_event_processing(true);
     } else {
       LOGW("awake off");
       set_brightness(s, 0);
-      system("service call window 18 i32 0");  // disable event processing
       framebuffer_set_power(s->fb, HWC_POWER_MODE_OFF);
+      enable_event_processing(false);
     }
   }
 #else
@@ -57,9 +68,37 @@ static void set_awake(UIState *s, bool awake) {
 #endif
 }
 
+static void update_offroad_layout_state(UIState *s) {
+  struct capn rc;
+  capn_init_malloc(&rc);
+  struct capn_segment *cs = capn_root(&rc).seg;
+
+  cereal_UiLayoutState_ptr layoutp = cereal_new_UiLayoutState(cs);
+  struct cereal_UiLayoutState layoutd = {
+    .activeApp = (cereal_UiLayoutState_App)s->active_app,
+    .sidebarCollapsed = s->scene.uilayout_sidebarcollapsed,
+  };
+  cereal_write_UiLayoutState(&layoutd, layoutp);
+  LOGD("setting active app to %d with sidebar %d", layoutd.activeApp, layoutd.sidebarCollapsed);
+
+  cereal_Event_ptr eventp = cereal_new_Event(cs);
+  struct cereal_Event event = {
+    .logMonoTime = nanos_since_boot(),
+    .which = cereal_Event_uiLayoutState,
+    .uiLayoutState = layoutp,
+  };
+  cereal_write_Event(&event, eventp);
+  capn_setp(capn_root(&rc), 0, eventp.p);
+  uint8_t buf[4096];
+  ssize_t rs = capn_write_mem(&rc, buf, sizeof(buf), 0);
+  s->offroad_sock->send((char*)buf, rs);
+  capn_free(&rc);
+}
+
 static void navigate_to_settings(UIState *s) {
 #ifdef QCOM
-  system("am broadcast -a 'ai.comma.plus.SidebarSettingsTouchUpInside'");
+  s->active_app = cereal_UiLayoutState_App_settings;
+  update_offroad_layout_state(s);
 #else
   // computer UI doesn't have offroad settings
 #endif
@@ -67,7 +106,12 @@ static void navigate_to_settings(UIState *s) {
 
 static void navigate_to_home(UIState *s) {
 #ifdef QCOM
-  system("am broadcast -a 'ai.comma.plus.HomeButtonTouchUpInside'");
+  if (s->vision_connected) {
+    s->active_app = cereal_UiLayoutState_App_none;
+  } else {
+    s->active_app = cereal_UiLayoutState_App_home;
+  }
+  update_offroad_layout_state(s);
 #else
   // computer UI doesn't have offroad home
 #endif
@@ -84,6 +128,7 @@ static void handle_sidebar_touch(UIState *s, int touch_x, int touch_y) {
       navigate_to_home(s);
       if (s->vision_connected) {
         s->scene.uilayout_sidebarcollapsed = true;
+        update_offroad_layout_state(s);
       }
     }
   }
@@ -93,6 +138,7 @@ static void handle_vision_touch(UIState *s, int touch_x, int touch_y) {
   if (s->vision_connected && (touch_x >= s->scene.ui_viz_rx - bdr_s)
     && (s->active_app != cereal_UiLayoutState_App_settings)) {
     s->scene.uilayout_sidebarcollapsed = !s->scene.uilayout_sidebarcollapsed;
+    update_offroad_layout_state(s);
   }
 }
 
@@ -119,6 +165,16 @@ static void read_param_float(float* param, const char* param_name) {
   }
 }
 
+static int read_param_uint64(uint64_t* dest, const char* param_name) {
+  char *s;
+  const int result = read_db_value(NULL, param_name, &s, NULL);
+  if (result == 0) {
+    *dest = strtoull(s, NULL, 0);
+    free(s);
+  }
+  return result;
+}
+
 static void read_param_bool_timeout(bool* param, const char* param_name, int* timeout) {
   if (*timeout > 0){
     (*timeout)--;
@@ -137,11 +193,20 @@ static void read_param_float_timeout(float* param, const char* param_name, int* 
   }
 }
 
+static int read_param_uint64_timeout(uint64_t* dest, const char* param_name, int* timeout) {
+  if (*timeout > 0){
+    (*timeout)--;
+    return 0;
+  } else {
+    return read_param_uint64(dest, param_name);
+    *timeout = 2 * UI_FREQ; // 0.5Hz
+  }
+}
+
 static void ui_init(UIState *s) {
   memset(s, 0, sizeof(UIState));
 
   pthread_mutex_init(&s->lock, NULL);
-  pthread_cond_init(&s->bg_cond, NULL);
 
   s->ctx = Context::create();
   s->model_sock = SubSocket::create(s->ctx, "model");
@@ -152,6 +217,7 @@ static void ui_init(UIState *s) {
   s->thermal_sock = SubSocket::create(s->ctx, "thermal");
   s->health_sock = SubSocket::create(s->ctx, "health");
   s->ubloxgnss_sock = SubSocket::create(s->ctx, "ubloxGnss");
+  s->offroad_sock = PubSocket::create(s->ctx, "offroadLayout");
 
   assert(s->model_sock != NULL);
   assert(s->controlsstate_sock != NULL);
@@ -161,6 +227,7 @@ static void ui_init(UIState *s) {
   assert(s->thermal_sock != NULL);
   assert(s->health_sock != NULL);
   assert(s->ubloxgnss_sock != NULL);
+  assert(s->offroad_sock != NULL);
 
   s->poller = Poller::create({
                               s->model_sock,
@@ -182,7 +249,7 @@ static void ui_init(UIState *s) {
   s->ipc_fd = -1;
 
   // init display
-  s->fb = framebuffer_init("ui", 0x00010000, true, &s->fb_w, &s->fb_h);
+  s->fb = framebuffer_init("ui", 0, true, &s->fb_w, &s->fb_h);
   assert(s->fb);
 
   set_awake(s, true);
@@ -294,8 +361,6 @@ static ModelData read_model(cereal_ModelData_ptr modelp) {
 static void update_status(UIState *s, int status) {
   if (s->status != status) {
     s->status = status;
-    // wake up bg thread to change
-    pthread_cond_signal(&s->bg_cond);
   }
 }
 
@@ -452,6 +517,9 @@ void handle_message(UIState *s, Message * msg) {
     cereal_read_UiLayoutState(&datad, eventd.uiLayoutState);
     s->active_app = datad.activeApp;
     s->scene.uilayout_sidebarcollapsed = datad.sidebarCollapsed;
+    if (datad.mockEngaged != s->scene.uilayout_mockengaged) {
+      s->scene.uilayout_mockengaged = datad.mockEngaged;
+    }
   } else if (eventd.which == cereal_Event_liveMapData) {
     struct cereal_LiveMapData datad;
     cereal_read_LiveMapData(&datad, eventd.liveMapData);
@@ -573,6 +641,7 @@ static void ui_update(UIState *s) {
     assert(glGetError() == GL_NO_ERROR);
 
     s->scene.uilayout_sidebarcollapsed = true;
+    update_offroad_layout_state(s);
     s->scene.ui_viz_rx = (box_x-sbr_w+bdr_s*2);
     s->scene.ui_viz_rw = (box_w+sbr_w-(bdr_s*2));
     s->scene.ui_viz_ro = 0;
@@ -794,35 +863,6 @@ fail:
   return NULL;
 }
 
-static void* bg_thread(void* args) {
-  UIState *s = (UIState*)args;
-  set_thread_name("bg");
-
-  FramebufferState *bg_fb = framebuffer_init("bg", 0x00001000, false, NULL, NULL);
-  assert(bg_fb);
-
-  int bg_status = -1;
-  while(!do_exit) {
-    pthread_mutex_lock(&s->lock);
-    if (bg_status == s->status) {
-      // will always be signaled if it changes?
-      pthread_cond_wait(&s->bg_cond, &s->lock);
-    }
-    bg_status = s->status;
-    pthread_mutex_unlock(&s->lock);
-
-    assert(bg_status < ARRAYSIZE(bg_colors));
-    const uint8_t *color = bg_colors[bg_status];
-
-    glClearColor(color[0]/256.0, color[1]/256.0, color[2]/256.0, 0.0);
-    glClear(GL_COLOR_BUFFER_BIT);
-
-    framebuffer_swap(bg_fb);
-  }
-
-  return NULL;
-}
-
 #endif
 
 int is_leon() {
@@ -853,6 +893,7 @@ int main(int argc, char* argv[]) {
   UIState uistate;
   UIState *s = &uistate;
   ui_init(s);
+  enable_event_processing(true);
 
   pthread_t connect_thread_handle;
   err = pthread_create(&connect_thread_handle, NULL,
@@ -863,11 +904,6 @@ int main(int argc, char* argv[]) {
   pthread_t light_sensor_thread_handle;
   err = pthread_create(&light_sensor_thread_handle, NULL,
                        light_sensor_thread, s);
-  assert(err == 0);
-
-  pthread_t bg_thread_handle;
-  err = pthread_create(&bg_thread_handle, NULL,
-                       bg_thread, s);
   assert(err == 0);
 #endif
 
@@ -926,14 +962,19 @@ int main(int argc, char* argv[]) {
     }
 
     if (!s->vision_connected) {
+      // always process events offroad
       if (s->status != STATUS_STOPPED) {
         update_status(s, STATUS_STOPPED);
+        s->active_app = cereal_UiLayoutState_App_home;
+        update_offroad_layout_state(s);
       }
       check_messages(s);
     } else {
       set_awake(s, true);
       if (s->status == STATUS_STOPPED) {
         update_status(s, STATUS_DISENGAGED);
+        s->active_app = cereal_UiLayoutState_App_none;
+        update_offroad_layout_state(s);
       }
       // Car started, fetch a new rgb image from ipc and peek for zmq events.
       ui_update(s);
@@ -941,6 +982,7 @@ int main(int argc, char* argv[]) {
         // Visiond process is just stopped, force a redraw to make screen blank again.
         s->scene.satelliteCount = -1;
         s->scene.uilayout_sidebarcollapsed = false;
+        update_offroad_layout_state(s);
         ui_draw(s);
         glFinish();
         should_swap = true;
@@ -1010,7 +1052,14 @@ int main(int argc, char* argv[]) {
     read_param_bool_timeout(&s->longitudinal_control, "LongitudinalControl", &s->longitudinal_control_timeout);
     read_param_bool_timeout(&s->limit_set_speed, "LimitSetSpeed", &s->limit_set_speed_timeout);
     read_param_float_timeout(&s->speed_lim_off, "SpeedLimitOffset", &s->limit_set_speed_timeout);
-
+    int param_read = read_param_uint64_timeout(&s->last_athena_ping, "LastAthenaPingTime", &s->last_athena_ping_timeout);
+    if (param_read != 0) {
+      s->scene.athenaStatus = NET_DISCONNECTED;
+    } else if (nanos_since_boot() - s->last_athena_ping < 70e9) {
+      s->scene.athenaStatus = NET_CONNECTED;
+    } else {
+      s->scene.athenaStatus = NET_ERROR;
+    }
     pthread_mutex_unlock(&s->lock);
 
     // the bg thread needs to be scheduled, so the main thread needs time without the lock
@@ -1031,14 +1080,10 @@ int main(int argc, char* argv[]) {
 
   // wake up bg thread to exit
   pthread_mutex_lock(&s->lock);
-  pthread_cond_signal(&s->bg_cond);
   pthread_mutex_unlock(&s->lock);
 
 #ifdef QCOM
   // join light_sensor_thread?
-
-  err = pthread_join(bg_thread_handle, NULL);
-  assert(err == 0);
 #endif
 
   err = pthread_join(connect_thread_handle, NULL);
